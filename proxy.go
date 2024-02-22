@@ -6,8 +6,6 @@ import (
 	"net/http"
 )
 
-// var transport = http.DefaultTransport
-
 func printRequest(r *http.Request) {
 	fmt.Println("=========Request=========")
 	fmt.Println(r.Method, r.RequestURI, r.Proto)
@@ -57,7 +55,6 @@ func copyResponseHeaders(from *http.Response, to http.ResponseWriter) {
 	to.WriteHeader(from.StatusCode)
 }
 
-// --------------------------------------------------------------------------------//
 func handleRequest(w http.ResponseWriter, r *http.Request) {
 	// printing request
 	printRequest(r)
@@ -92,9 +89,17 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 	// copying headers from proxy response to src response
 	copyResponseHeaders(response, w)
 
-	// copying body from proxy response to src response
-	io.Copy(w, response.Body)
+	// reading the body of the proxy response
+	body, err := io.ReadAll(response.Body)
+	if err != nil {
+		http.Error(w, "Error reading proxy response body", http.StatusInternalServerError)
+		return
+	}
+
+	// writing the body to the main response
+	w.Write(body)
 }
+
 
 func main() {
 	// creating server
