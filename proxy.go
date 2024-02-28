@@ -1,10 +1,18 @@
 package main
 
 import (
+	"database/sql"
+	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
+	"os"
+
+	_ "github.com/lib/pq"
 )
+
+var db *sql.DB
 
 func printRequest(r *http.Request) {
 	fmt.Println("=========Request=========")
@@ -55,65 +63,166 @@ func copyResponseHeaders(from *http.Response, to http.ResponseWriter) {
 	to.WriteHeader(from.StatusCode)
 }
 
+func saveRequestToDB(r *http.Request) error {
+    // Parse cookies
+    cookies := make(map[string]interface{})
+    for _, cookie := range r.Cookies() {
+        cookies[cookie.Name] = cookie.Value
+    }
+
+    // Parse POST form
+    err := r.ParseForm()
+    if err != nil {
+        return err
+    }
+
+    postParams := make(map[string]interface{})
+    for key, values := range r.PostForm {
+        if len(values) > 0 {
+            postParams[key] = values[0]
+        }
+    }
+
+    // Marshal request data
+    getParams := make(map[string]interface{})
+    for key, values := range r.URL.Query() {
+        if len(values) > 0 {
+            getParams[key] = values[0]
+        }
+    }
+
+    headers := make(map[string]interface{})
+    for key, values := range r.Header {
+        if len(values) > 0 {
+            headers[key] = values[0]
+        }
+    }
+
+    // Marshal request data
+    requestData, err := json.Marshal(map[string]interface{}{
+        "method":      r.Method,
+        "path":        r.URL.Path,
+        "get_params":  getParams,
+        "headers":     headers,
+        "cookies":     cookies,
+        "post_params": postParams,
+    })
+    if err != nil {
+        return err
+    }
+
+		log.Print(requestData)
+
+    // Insert request data into the database
+    _, err = db.Exec("INSERT INTO requests (method, path, get_params, headers, cookies, post_params) VALUES ($1, $2, $3, $4, $5, $6)",
+        r.Method, r.URL.Path, getParams, headers, cookies, postParams)
+    return err
+}
+
+
+func saveResponseToDB(code int, message string, headers http.Header, body []byte) error {
+    // Parse response headers
+    headersMap := make(map[string]interface{})
+    for key, values := range headers {
+        if len(values) > 0 {
+            headersMap[key] = values[0]
+        }
+    }
+
+    // Insert response data into the database
+    _, err := db.Exec("INSERT INTO responses (code, message, headers, body) VALUES ($1, $2, $3, $4)",
+        code, message, headersMap, string(body))
+    return err
+}
+
+
 func handleRequest(w http.ResponseWriter, r *http.Request) {
-	// printing request
-	printRequest(r)
+    // Saving request to DB
+    err := saveRequestToDB(r)
+    if err != nil {
+        http.Error(w, "Error saving request to DB", http.StatusInternalServerError)
+        return
+    }
 
-	// deleting header Proxy-Connection
-	r.Header.Del("Proxy-Connection")
+    // printing request
+    printRequest(r)
 
-	// replacing path with relative
-	r.RequestURI = r.URL.Path
+    // deleting header Proxy-Connection
+    r.Header.Del("Proxy-Connection")
 
-	// creating proxy request with the same method, url and body
-	proxyReq, err := http.NewRequest(r.Method, r.URL.String(), r.Body)
-	if err != nil {
-		http.Error(w, "cant create proxy request", http.StatusInternalServerError)
-		return
-	}
+    // replacing path with relative
+    r.RequestURI = r.URL.Path
 
-	// copying headers from src request to proxy request
-	copyRequestHeaders(r, proxyReq)
+    // creating proxy request with the same method, url and body
+    proxyReq, err := http.NewRequest(r.Method, r.URL.String(), r.Body)
+    if err != nil {
+        http.Error(w, "cant create proxy request", http.StatusInternalServerError)
+        return
+    }
 
-	// sending proxy request using transport
-	response, err := http.DefaultTransport.RoundTrip(proxyReq)
-	if err != nil {
-		http.Error(w, "Error sending proxy request", http.StatusInternalServerError)
-		return
-	}
-	defer response.Body.Close()
+    // copying headers from src request to proxy request
+    copyRequestHeaders(r, proxyReq)
 
-	// printing response
-	printResponse(response)
+    // sending proxy request using transport
+    response, err := http.DefaultTransport.RoundTrip(proxyReq)
+    if err != nil {
+        http.Error(w, "Error sending proxy request", http.StatusInternalServerError)
+        return
+    }
+    defer response.Body.Close()
 
-	// copying headers from proxy response to src response
-	copyResponseHeaders(response, w)
+    // printing response
+    printResponse(response)
 
-	// reading the body of the proxy response
-	body, err := io.ReadAll(response.Body)
-	if err != nil {
-		http.Error(w, "Error reading proxy response body", http.StatusInternalServerError)
-		return
-	}
+    // reading the body of the proxy response
+    body, err := io.ReadAll(response.Body)
+    if err != nil {
+        http.Error(w, "Error reading proxy response body", http.StatusInternalServerError)
+        return
+    }
 
-	// writing the body to the main response
-	w.Write(body)
+    // Saving response data to DB
+    err = saveResponseToDB(response.StatusCode, response.Status, response.Header, body)
+    if err != nil {
+        http.Error(w, "Error saving response to DB", http.StatusInternalServerError)
+        return
+    }
+
+
+    // copying headers from proxy response to src response
+    copyResponseHeaders(response, w)
+
+    // writing the body to the main response
+    w.Write(body)
 }
 
 
 func main() {
-	// creating server
-	server := http.Server{
-		Addr:    ":8080",
-		Handler: http.HandlerFunc(handleRequest),
-	}
+    // Connect to PostgreSQL
+    connStr := fmt.Sprintf("host=db user=%s dbname=%s password=%s sslmode=disable", 
+    os.Getenv("POSTGRES_USER"), 
+    os.Getenv("POSTGRES_DB"), 
+    os.Getenv("POSTGRES_PASSWORD"))
 
-	fmt.Println("server started on :8080")
+    var err error
+    db, err = sql.Open("postgres", connStr)
+    if err != nil {
+        panic(err)
+    }
+    defer db.Close()
 
-	// starting server
-	err := server.ListenAndServe()
-	if err != nil {
-		fmt.Errorf("Error starting proxy server: ", err)
-	}
-	
+
+    // creating server
+    server := http.Server{
+        Addr:    ":8080",
+        Handler: http.HandlerFunc(handleRequest),
+    }
+
+    fmt.Println("server started on :8080")
+
+    // starting server
+    err = server.ListenAndServe()
+    if err != nil {
+        fmt.Errorf("Error starting proxy server: ", err)
+    }
 }
